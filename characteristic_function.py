@@ -73,34 +73,65 @@ def characteristic_function(
 
 
 def _cf_continuous(u, x, r, T, sigmas, q12, q21, dt, regime):
-    """Continuous-time CF via matrix exponential."""
+    """Continuous-time CF via vectorized 2×2 closed-form matrix exponential."""
     # Convert discrete-time transition probs to continuous-time intensities
-    #   λ = -ln(1 - q) / dt
     lam12 = -np.log(1 - q12) / dt
     lam21 = -np.log(1 - q21) / dt
 
-    # Handle scalar or array u
     u = np.atleast_1d(np.asarray(u, dtype=complex))
-    result = np.empty(len(u), dtype=complex)
 
-    for i, ui in enumerate(u):
-        # α(u) = -(iu + u²) / 2
-        alpha = -(1j * ui + ui**2) / 2.0
+    # α(u) = -(iu + u²) / 2   (vectorized over all u)
+    alpha = -(1j * u + u**2) / 2.0
 
-        # a_k(u) = α(u) · σ_k²
-        a0 = alpha * sigmas[0]**2
-        a1 = alpha * sigmas[1]**2
+    # M(u) entries:  m11 = -λ12 + a0(u),  m12 = λ12,  m21 = λ21,  m22 = -λ21 + a1(u)
+    a0 = alpha * sigmas[0]**2
+    a1 = alpha * sigmas[1]**2
+    m11 = -lam12 + a0
+    m22 = -lam21 + a1
+    m12 = lam12   # scalar, broadcast
+    m21 = lam21   # scalar, broadcast
 
-        # M(u) = G̃ + diag(a₀, a₁)
-        M = np.array([
-            [-lam12 + a0, lam12],
-            [lam21,       -lam21 + a1]
-        ], dtype=complex)
+    # Eigenvalues of M(u):  η± = (tr ± √(tr² - 4det)) / 2
+    tr = m11 + m22
+    det = m11 * m22 - m12 * m21
+    disc = tr**2 - 4.0 * det
+    sqrt_disc = np.sqrt(disc + 0j)
 
-        # φ_j = exp(iu·x + iu·r·T) · [exp(M·T) · 1]_j
-        eM = expm(M * T)
-        f = eM @ np.ones(2)
-        result[i] = np.exp(1j * ui * x + 1j * ui * r * T) * f[regime]
+    eta_p = (tr + sqrt_disc) / 2.0
+    eta_m = (tr - sqrt_disc) / 2.0
+    diff = eta_p - eta_m
+
+    # exp(M·T)·1 using Sylvester formula:
+    # exp(MT) = [(η₊e^{η₋T} - η₋e^{η₊T})·I + (e^{η₊T} - e^{η₋T})·M] / (η₊ - η₋)
+    # We only need [exp(MT)·1]_j, so expand:
+    #   f₀ = [η₊e^{η₋T}-η₋e^{η₊T} + (e^{η₊T}-e^{η₋T})·(m11+m12)] / diff
+    #   f₁ = [η₊e^{η₋T}-η₋e^{η₊T} + (e^{η₊T}-e^{η₋T})·(m21+m22)] / diff
+    with np.errstate(over="ignore", invalid="ignore"):
+        exp_p = np.exp(eta_p * T)
+        exp_m = np.exp(eta_m * T)
+
+        coeff_I = eta_p * exp_m - eta_m * exp_p   # coefficient of I
+        coeff_M = exp_p - exp_m                     # coefficient of M
+
+        # Handle degenerate case (diff ≈ 0) carefully
+        safe_diff = np.where(np.abs(diff) < 1e-14, 1.0, diff)
+
+        f0 = (coeff_I + coeff_M * (m11 + m12)) / safe_diff
+        f1 = (coeff_I + coeff_M * (m21 + m22)) / safe_diff
+
+        # For degenerate eigenvalues: exp(MT)·1 ≈ exp(η·T)·(I + (M - ηI)T)·1
+        degen_mask = np.abs(diff) < 1e-14
+        if np.any(degen_mask):
+            eta_avg = (eta_p[degen_mask] + eta_m[degen_mask]) / 2
+            e_eta = np.exp(eta_avg * T)
+            f0[degen_mask] = e_eta * (1 + (m11[degen_mask] - eta_avg + m12) * T)
+            f1[degen_mask] = e_eta * (1 + (m21 + m22[degen_mask] - eta_avg) * T)
+
+        # Select the regime row
+        f = f0 if regime == 0 else f1
+
+        # Full CF:  φ_j(u) = exp(iu·x + iu·r·T) · f_j(u)
+        result = np.exp(1j * u * x + 1j * u * r * T) * f
 
     return result if len(result) > 1 else result[0]
 
